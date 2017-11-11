@@ -1,0 +1,8 @@
+[package]
+name = "writium-cache"
+version = "0.1.0"
+authors = ["PENGUINLIONG <admin@penguinliong.moe>"]
+
+
+[dependencies]
+lru-cache = "0.1"
