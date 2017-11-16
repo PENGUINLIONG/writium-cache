@@ -1,58 +1,40 @@
 #![allow(dead_code)]
 ///! Implementation of cache functionality for common use of Writium APIs.
-///!
-///! To obey the rule, 'Do not communicate by sharing memory; instead, share
-///! memory by communicating,' Writium cache doesn't allow memory borrowing.
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 use lru_cache::LruCache;
 
 /// Cache for each Writium Api. Any Writium Api can be composited with this
 /// struct for cache.
 pub struct Cache<Src: 'static + CacheSource> {
-    cache: RwLock<LruCache<String, Src::Value>>,
+    cache: Mutex<LruCache<String, Arc<RwLock<Src::Value>>>>,
     src: Src,
 }
 impl<Src: 'static + CacheSource> Cache<Src> {
     pub fn new(capacity: usize, src: Src) -> Cache<Src> {
         Cache {
-            cache: RwLock::new(LruCache::new(capacity)),
+            cache: Mutex::new(LruCache::new(capacity)),
             src: src,
         }
-    }
-
-    // Try to get the object identified by given ID. `None` is returned directly
-    // if the value is not cached.
-    fn fetch(&self, id: &str) -> Option<Src::Value> {
-        let guard = self.cache.read().unwrap();
-        if let Some((_, val)) = guard.iter().find(|x| x.0 == id) {
-            Some(val.clone())
-        } else { None }
     }
 
     /// Get the object identified by given ID. If the object is not cached, try
     /// generating its cache with provided generation function. If there is no
     /// space for another object, the last recently accessed cache will be
     /// disposed.
-    pub fn get(&self, id: &str) -> Option<Src::Value> {
-        let cached = self.fetch(id);
-        if cached.is_some() { return cached }
-        if let Some(new) = self.src.generate(id) {
-            let mut guard = self.cache.write().unwrap();
-            guard.insert(id.to_string(), new);
-        } else { return None }
-        self.fetch(id)
-    }
-
-    /// Set the object identified by given ID with provided new one. If the
-    /// object is not cached, try generating its cache with provided generation
-    /// function. If there is no space for another object, the last recently
-    /// accessed cache will be disposed and returned.
-    pub fn insert(&self, id: &str, new_val: Src::Value) -> Option<Src::Value> {
-        let mut guard = self.cache.write().unwrap();
-        if let Some(mut old_val) = guard.insert(id.to_string(), new_val) {
-            self.src.dispose(id, &mut old_val);
-            Some(old_val)
-        } else { None }
+    pub fn get(&self, id: &str) -> Option<Arc<RwLock<Src::Value>>> {
+        let mut lock = self.cache.lock().unwrap();
+        // Check if the resource is already cached.
+        if let Some(cached) = lock.get_mut(id) {
+            return Some(cached.clone())
+        }
+        // Requested resource is not yet cached. Generate now.
+        if let Some(new_val) = self.src.generate(id) {
+            let new_arc = Arc::new(RwLock::new(new_val));
+            lock.insert(id.to_string(), new_arc.clone());
+            Some(new_arc)
+        } else {
+            None
+        }
     }
 
     /// Remove the object identified by given ID. If the object is not cached,
@@ -61,23 +43,33 @@ impl<Src: 'static + CacheSource> Cache<Src> {
     /// another object, the last recently accessed cache will be disposed. The
     /// value removed as cache is returned.
     pub fn remove(&self, id: &str) -> Option<Src::Value> {
-        let mut guard = self.cache.write().unwrap();
-        if let Some(mut old_val) = guard.remove(id) {
-            self.src.remove(id, &mut old_val);
-            Some(old_val)
+        let mut lock = self.cache.lock().unwrap();
+        if let Some(old_val) = lock.remove(id) {
+            use std::ops::DerefMut;
+            // When this write lock is successfully retrieved, there should be
+            // no other thread accessing it:
+            //
+            // 1. No read guard stays alive;
+            // 2. It's nolonger accessed through `self.cache`.
+            self.src.remove(id, old_val.write().unwrap().deref_mut());
+            if let Ok(rwlock) = Arc::try_unwrap(old_val) {
+                Some(rwlock.into_inner().unwrap())
+            } else {
+                panic!("unexpected use of cache");
+            }
         } else { None }
     }
 
     /// The maximum number of items can be cached at a same time.
     pub fn capacity(&self) -> usize {
         // Only if the thread is poisoned `cache` will be unavailable.
-        self.cache.read().unwrap().capacity()
+        self.cache.lock().unwrap().capacity()
     }
 
     /// Get the number of items cached.
     pub fn len(&self) -> usize {
         // Only if the thread is poisoned `cache` will be unavailable.
-        self.cache.read().unwrap().len()
+        self.cache.lock().unwrap().len()
     }
 }
 
