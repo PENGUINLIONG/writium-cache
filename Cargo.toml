@@ -9,3 +9,4 @@ description = "Common cache system for Writium APIs"
 
 [dependencies]
 lru-cache = "0.1"
+writium-framework = { version = "0.1", path = "P:/writium-framework" }

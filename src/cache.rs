@@ -2,6 +2,12 @@
 ///! Implementation of cache functionality for common use of Writium APIs.
 use std::sync::{Arc, Mutex, RwLock};
 use lru_cache::LruCache;
+use writium_framework::{WritiumError as Error};
+use writium_framework::hyper::StatusCode;
+
+const UNABLE_TO_GEN_CACHE: &str = "Unable to generate cache.";
+const UNABLE_TO_REM_CACHE: &str = "Unable to remove cache.";
+const UNEXPECTED_USE_OF_CACHE: &str = "unexpected use of cache";
 
 /// Cache for each Writium Api. Any Writium Api can be composited with this
 /// struct for cache.
@@ -21,19 +27,19 @@ impl<Src: 'static + CacheSource> Cache<Src> {
     /// generating its cache with provided generation function. If there is no
     /// space for another object, the last recently accessed cache will be
     /// disposed.
-    pub fn get(&self, id: &str) -> Option<Arc<RwLock<Src::Value>>> {
+    pub fn get(&self, id: &str) -> Result<Arc<RwLock<Src::Value>>, Error> {
         let mut lock = self.cache.lock().unwrap();
         // Check if the resource is already cached.
         if let Some(cached) = lock.get_mut(id) {
-            return Some(cached.clone())
+            return Ok(cached.clone())
         }
         // Requested resource is not yet cached. Generate now.
         if let Some(new_val) = self.src.generate(id) {
             let new_arc = Arc::new(RwLock::new(new_val));
             lock.insert(id.to_string(), new_arc.clone());
-            Some(new_arc)
+            Ok(new_arc)
         } else {
-            None
+            Err(Error::new(StatusCode::InternalServerError, UNABLE_TO_GEN_CACHE))
         }
     }
 
@@ -42,7 +48,7 @@ impl<Src: 'static + CacheSource> Cache<Src> {
     /// remove it. In case cache generation is needed. If there is no space for
     /// another object, the last recently accessed cache will be disposed. The
     /// value removed as cache is returned.
-    pub fn remove(&self, id: &str) -> Option<Src::Value> {
+    pub fn remove(&self, id: &str) -> Result<Src::Value, Error> {
         let mut lock = self.cache.lock().unwrap();
         if let Some(old_val) = lock.remove(id) {
             use std::ops::DerefMut;
@@ -53,11 +59,13 @@ impl<Src: 'static + CacheSource> Cache<Src> {
             // 2. It's nolonger accessed through `self.cache`.
             self.src.remove(id, old_val.write().unwrap().deref_mut());
             if let Ok(rwlock) = Arc::try_unwrap(old_val) {
-                Some(rwlock.into_inner().unwrap())
+                Ok(rwlock.into_inner().unwrap())
             } else {
-                panic!("unexpected use of cache");
+                Err(Error::new(StatusCode::InternalServerError, UNEXPECTED_USE_OF_CACHE))
             }
-        } else { None }
+        } else {
+            Err(Error::new(StatusCode::InternalServerError, UNABLE_TO_REM_CACHE))
+         }
     }
 
     /// The maximum number of items can be cached at a same time.
