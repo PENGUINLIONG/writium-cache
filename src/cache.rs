@@ -37,9 +37,8 @@ impl<Src: 'static + CacheSource> Cache<Src> {
     }
 
     /// Get the object identified by given ID. If the object is not cached, try
-    /// generating its cache with provided generation function. If there is no
-    /// space for another object, the last recently accessed cache will be
-    /// disposed.
+    /// recovering its cache from provided source. If there is no space for
+    /// another object, the last recently accessed cache will be disposed.
     pub fn get(&self, id: &str) -> WritiumResult<Arc<RwLock<Src::Value>>> {
         let inner = self.inner.clone();
         let id = id.to_owned();
@@ -79,10 +78,9 @@ impl<Src: 'static + CacheSource> Cache<Src> {
     }
 
     /// Remove the object identified by given ID. If the object is not cached,
-    /// try generating its cache with provided generation function and then
-    /// remove it. In case cache generation is needed. If there is no space for
-    /// another object, the last recently accessed cache will be disposed. The
-    /// value removed as cache is returned.
+    /// try recovering its cache from provided source and then remove it. In
+    /// case cache generation is needed, the cache stays intact with no cached
+    /// object disposed, because the use of generated object is transient.
     pub fn remove(&self, id: &str) -> WritiumResult<Src::Value> {
         let inner = self.inner.clone();
         let id = id.to_owned();
@@ -91,9 +89,7 @@ impl<Src: 'static + CacheSource> Cache<Src> {
             let pos = lock.iter().position(|&(ref nid, _)| nid == &id);
             if let Some(pos) = pos {
                 // Cache found.
-                let res = lock.remove(pos);
-                lock.push(res.clone());
-                let (old_id, old_val) = lock.remove(0);
+                let (old_id, old_val) = lock.remove(pos);
                 let mut old_val = if let Ok(rw) = Arc::try_unwrap(old_val) {
                     rw.into_inner().unwrap()
                 } else {
@@ -146,6 +142,7 @@ pub trait CacheSource: 'static + Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use ::writium_framework::futures::Future;
     // `bool` controls always fail.
     struct TestSource(bool);
     impl super::CacheSource for TestSource {
@@ -170,47 +167,48 @@ mod tests {
     #[test]
     fn test_cache() {
         let cache = make_cache(false);
-        assert_eq!(cache.get("0"), Some("cache0"));
-        assert_eq!(cache.get("1"), Some("cache1"));
-        assert_eq!(cache.get("2"), Some("cache2"));
+        assert!(cache.get("0").wait().is_ok());
+        assert!(cache.get("1").wait().is_ok());
+        assert!(cache.get("2").wait().is_ok());
     }
     #[test]
     fn test_cache_failure() {
         let cache = make_cache(true);
-        assert_eq!(cache.get("0"), None);
-        assert_eq!(cache.get("1"), None);
-        assert_eq!(cache.get("2"), None);
+        assert!(cache.get("0").wait().is_err());
+        assert!(cache.get("1").wait().is_err());
+        assert!(cache.get("2").wait().is_err());
     }
     #[test]
     fn test_max_cache() {
         let cache = make_cache(false);
-        assert_eq!(cache.len(), 0);
-        assert_eq!(cache.get("0"), Some("cache0"));
-        assert_eq!(cache.len(), 1);
-        assert_eq!(cache.get("1"), Some("cache1"));
-        assert_eq!(cache.len(), 2);
-        assert_eq!(cache.get("2"), Some("cache2"));
-        assert_eq!(cache.len(), 3);
-        assert_eq!(cache.get("3"), Some("cache3"));
-        assert_eq!(cache.len(), 3);
+        assert!(cache.len() == 0);
+        assert!(cache.get("0").wait().is_ok());
+        assert!(cache.len() == 1);
+        assert!(cache.get("1").wait().is_ok());
+        assert!(cache.len() == 2);
+        assert!(cache.get("2").wait().is_ok());
+        assert!(cache.len() == 3);
+        assert!(cache.get("3").wait().is_ok());
+        assert!(cache.len() == 3);
     }
     #[test]
     fn test_max_cache_failure() {
         let cache = make_cache(true);
-        assert_eq!(cache.len(), 0);
-        assert_eq!(cache.get("0"), None);
-        assert_eq!(cache.len(), 0);
+        assert!(cache.len() == 0);
+        assert!(cache.get("0").wait().is_err());
+        assert!(cache.len() == 0);
         cache.get("1");
-        assert_eq!(cache.len(), 0);
+        assert!(cache.len() == 0);
         cache.get("2");
-        assert_eq!(cache.len(), 0);
+        assert!(cache.len() == 0);
     }
     #[test]
     fn test_remove() {
         let cache = make_cache(false);
-        cache.get("0");
-        assert_eq!(cache.len(), 1);
-        assert_eq!(cache.remove("0"), Some("removed"));
-        assert_eq!(cache.len(), 0);
+        assert!(cache.get("0").wait().is_ok());
+        assert!(cache.len() == 1);
+        assert!(cache.remove("0").wait().is_ok());
+        assert!(cache.len() == 0);
+        assert!(cache.remove("0").wait().is_ok());
     }
 }
