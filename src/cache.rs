@@ -64,6 +64,7 @@ impl<Src: 'static + CacheSource> Cache<Src> {
                         let mut old_val = if let Ok(rw) = Arc::try_unwrap(old_val) {
                             rw.into_inner().unwrap()
                         } else {
+                            warn!("{}: {}", UNEXPECTED_USE_OF_CACHE, id);
                             return Err(WritiumError::internal(UNEXPECTED_USE_OF_CACHE))
                         };
                         inner.src.dispose(&old_id, &mut old_val);
@@ -71,6 +72,7 @@ impl<Src: 'static + CacheSource> Cache<Src> {
                     lock.push((id.to_string(), new_arc.clone()));
                     Ok(Async::Ready(new_arc))
                 } else {
+                    warn!("{}: {}", UNABLE_TO_GEN_CACHE, id);
                     Err(WritiumError::not_found(UNABLE_TO_GEN_CACHE))
                 }
             }
@@ -93,6 +95,7 @@ impl<Src: 'static + CacheSource> Cache<Src> {
                 let mut old_val = if let Ok(rw) = Arc::try_unwrap(old_val) {
                     rw.into_inner().unwrap()
                 } else {
+                    warn!("{}: {}", UNEXPECTED_USE_OF_CACHE, id);
                     return Err(WritiumError::internal(UNEXPECTED_USE_OF_CACHE))
                 };
                 inner.src.remove(&old_id, &mut old_val);
@@ -104,6 +107,7 @@ impl<Src: 'static + CacheSource> Cache<Src> {
                     inner.src.remove(&id, &mut new_val);
                     Ok(Async::Ready(new_val))
                 } else {
+                    warn!("{}: {}", UNABLE_TO_REM_CACHE, id);
                     Err(WritiumError::not_found(UNABLE_TO_REM_CACHE))
                 }
             }
