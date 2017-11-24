@@ -1,25 +1,38 @@
 #![allow(dead_code)]
 ///! Implementation of cache functionality for common use of Writium APIs.
 use std::sync::{Arc, Mutex, RwLock};
-use lru_cache::LruCache;
-use writium_framework::{WritiumError as Error};
-use writium_framework::hyper::StatusCode;
+use writium_framework::prelude::*;
+use writium_framework::futures::{Async, Poll};
+use writium_framework::futures::future::poll_fn;
 
-const UNABLE_TO_GEN_CACHE: &str = "Unable to generate cache.";
-const UNABLE_TO_REM_CACHE: &str = "Unable to remove cache.";
-const UNEXPECTED_USE_OF_CACHE: &str = "unexpected use of cache";
+const UNABLE_TO_GEN_CACHE: &str = "Unable to generate cache because the resource doesn't exist.";
+const UNABLE_TO_REM_CACHE: &str = "Unable to remove cache because the resource doesn't exist.";
+const UNEXPECTED_USE_OF_CACHE: &str = "Unexpected use of cache.";
 
 /// Cache for each Writium Api. Any Writium Api can be composited with this
 /// struct for cache.
-pub struct Cache<Src: 'static + CacheSource> {
-    cache: Mutex<LruCache<String, Arc<RwLock<Src::Value>>>>,
+struct CacheInner<Src: 'static + CacheSource> {
+    capacity: usize,
+    cache: Mutex<Vec<(String, Arc<RwLock<Src::Value>>)>>,
     src: Src,
+}
+impl<Src: 'static + CacheSource> CacheInner<Src> {
+    pub fn new(capacity: usize, src: Src) -> CacheInner<Src> {
+        CacheInner {
+            capacity: capacity,
+            cache: Mutex::new(Vec::with_capacity(capacity)),
+            src: src,
+        }
+    }
+}
+#[derive(Clone)]
+pub struct Cache<Src: 'static + CacheSource> {
+    inner: Arc<CacheInner<Src>>
 }
 impl<Src: 'static + CacheSource> Cache<Src> {
     pub fn new(capacity: usize, src: Src) -> Cache<Src> {
         Cache {
-            cache: Mutex::new(LruCache::new(capacity)),
-            src: src,
+            inner: Arc::new(CacheInner::new(capacity, src)),
         }
     }
 
@@ -27,20 +40,42 @@ impl<Src: 'static + CacheSource> Cache<Src> {
     /// generating its cache with provided generation function. If there is no
     /// space for another object, the last recently accessed cache will be
     /// disposed.
-    pub fn get(&self, id: &str) -> Result<Arc<RwLock<Src::Value>>, Error> {
-        let mut lock = self.cache.lock().unwrap();
-        // Check if the resource is already cached.
-        if let Some(cached) = lock.get_mut(id) {
-            return Ok(cached.clone())
-        }
-        // Requested resource is not yet cached. Generate now.
-        if let Some(new_val) = self.src.generate(id) {
-            let new_arc = Arc::new(RwLock::new(new_val));
-            lock.insert(id.to_string(), new_arc.clone());
-            Ok(new_arc)
-        } else {
-            Err(Error::new(StatusCode::InternalServerError, UNABLE_TO_GEN_CACHE))
-        }
+    pub fn get(&self, id: &str) -> WritiumResult<Arc<RwLock<Src::Value>>> {
+        let inner = self.inner.clone();
+        let id = id.to_owned();
+        poll_fn(move || -> Poll<Arc<RwLock<Src::Value>>, WritiumError> {
+            let mut lock = inner.cache.lock().unwrap();
+            let pos = lock.iter().position(|&(ref nid, _)| nid == &id);
+            if let Some(pos) = pos {
+                // Cache found.
+                let res = lock.remove(pos);
+                lock.push(res.clone());
+                return Ok(Async::Ready(res.1))
+            } else {
+                // Requested resource is not yet cached. Generate now.
+                if let Some(new_val) = inner.src.generate(&id) {
+                    let new_arc = Arc::new(RwLock::new(new_val));
+                    if lock.len() == lock.capacity() {
+                        // When this write lock is successfully retrieved, there
+                        // should be no other thread accessing it:
+                        //
+                        // 1. No read guard stays alive;
+                        // 2. It's nolonger accessed through `self.inner.cache`.
+                        let (old_id, old_val) = lock.remove(0);
+                        let mut old_val = if let Ok(rw) = Arc::try_unwrap(old_val) {
+                            rw.into_inner().unwrap()
+                        } else {
+                            return Err(WritiumError::internal(UNEXPECTED_USE_OF_CACHE))
+                        };
+                        inner.src.dispose(&old_id, &mut old_val);
+                    }
+                    lock.push((id.to_string(), new_arc.clone()));
+                    Ok(Async::Ready(new_arc))
+                } else {
+                    Err(WritiumError::not_found(UNABLE_TO_GEN_CACHE))
+                }
+            }
+        }).into_result()
     }
 
     /// Remove the object identified by given ID. If the object is not cached,
@@ -48,36 +83,47 @@ impl<Src: 'static + CacheSource> Cache<Src> {
     /// remove it. In case cache generation is needed. If there is no space for
     /// another object, the last recently accessed cache will be disposed. The
     /// value removed as cache is returned.
-    pub fn remove(&self, id: &str) -> Result<Src::Value, Error> {
-        let mut lock = self.cache.lock().unwrap();
-        if let Some(old_val) = lock.remove(id) {
-            use std::ops::DerefMut;
-            // When this write lock is successfully retrieved, there should be
-            // no other thread accessing it:
-            //
-            // 1. No read guard stays alive;
-            // 2. It's nolonger accessed through `self.cache`.
-            self.src.remove(id, old_val.write().unwrap().deref_mut());
-            if let Ok(rwlock) = Arc::try_unwrap(old_val) {
-                Ok(rwlock.into_inner().unwrap())
+    pub fn remove(&self, id: &str) -> WritiumResult<Src::Value> {
+        let inner = self.inner.clone();
+        let id = id.to_owned();
+        poll_fn(move || {
+            let mut lock = inner.cache.lock().unwrap();
+            let pos = lock.iter().position(|&(ref nid, _)| nid == &id);
+            if let Some(pos) = pos {
+                // Cache found.
+                let res = lock.remove(pos);
+                lock.push(res.clone());
+                let (old_id, old_val) = lock.remove(0);
+                let mut old_val = if let Ok(rw) = Arc::try_unwrap(old_val) {
+                    rw.into_inner().unwrap()
+                } else {
+                    return Err(WritiumError::internal(UNEXPECTED_USE_OF_CACHE))
+                };
+                inner.src.remove(&old_id, &mut old_val);
+                return Ok(Async::Ready(old_val))
             } else {
-                Err(Error::new(StatusCode::InternalServerError, UNEXPECTED_USE_OF_CACHE))
+                // Requested resource is not yet cached. See if we can restore
+                // it from source.
+                if let Some(mut new_val) = inner.src.generate(&id) {
+                    inner.src.remove(&id, &mut new_val);
+                    Ok(Async::Ready(new_val))
+                } else {
+                    Err(WritiumError::not_found(UNABLE_TO_REM_CACHE))
+                }
             }
-        } else {
-            Err(Error::new(StatusCode::InternalServerError, UNABLE_TO_REM_CACHE))
-         }
+        }).into_result()
     }
 
     /// The maximum number of items can be cached at a same time.
     pub fn capacity(&self) -> usize {
         // Only if the thread is poisoned `cache` will be unavailable.
-        self.cache.lock().unwrap().capacity()
+        self.inner.cache.lock().unwrap().capacity()
     }
 
     /// Get the number of items cached.
     pub fn len(&self) -> usize {
         // Only if the thread is poisoned `cache` will be unavailable.
-        self.cache.lock().unwrap().len()
+        self.inner.cache.lock().unwrap().len()
     }
 }
 

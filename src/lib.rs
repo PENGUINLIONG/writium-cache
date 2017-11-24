@@ -1,4 +1,3 @@
-extern crate lru_cache;
 extern crate writium_framework;
 
 mod cache;
