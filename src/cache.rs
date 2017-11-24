@@ -143,6 +143,20 @@ pub trait CacheSource: 'static + Send + Sync {
     /// optional process.
     fn remove(&self, _id: &str, _obj: &mut Self::Value) {}
 }
+impl<Src: 'static + CacheSource> Drop for Cache<Src> {
+    /// Implement drop so that modified cached data can be returned to source
+    /// properly.
+    fn drop(&mut self) {
+        let mut lock = self.inner.cache.lock().unwrap();
+        while let Some((id, val)) = lock.pop() {
+            if let Ok(val) = Arc::try_unwrap(val) {
+                self.inner.src.dispose(&id, &mut val.into_inner().unwrap());
+            } else {
+                warn!("{}: {}", UNEXPECTED_USE_OF_CACHE, id);
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
