@@ -38,7 +38,16 @@ impl<Src: 'static + CacheSource> Cache<Src> {
     /// Get the object identified by given ID. If the object is not cached, try
     /// recovering its cache from provided source. If there is no space for
     /// another object, the last recently accessed cache will be disposed.
+    pub fn create(&self, id: &str) -> WritiumResult<Arc<RwLock<Src::Value>>> {
+        self._get(id, true)
+    }
+    /// Get the object identified by given ID. If the object is not cached,
+    /// error will be returned. If there is no space for another object, the
+    /// last recently accessed cache will be disposed.
     pub fn get(&self, id: &str) -> WritiumResult<Arc<RwLock<Src::Value>>> {
+        self._get(id, false)
+    }
+    fn _get(&self, id: &str, create: bool) -> WritiumResult<Arc<RwLock<Src::Value>>> {
         let id = id.to_owned();
         let pos = {
             let inner = self.inner.clone();
@@ -55,7 +64,7 @@ impl<Src: 'static + CacheSource> Cache<Src> {
         } else {
             // Requested resource is not yet cached. Load now.
             let inner = self.inner.clone();
-            self.inner.clone().src.load(&id)
+            self.inner.clone().src.load(&id, create)
                 .map(|new_val| { Arc::new(RwLock::new(new_val)) })
                 .join({
                     let mut lock = inner.cache.lock().unwrap();
@@ -104,7 +113,7 @@ impl<Src: 'static + CacheSource> Cache<Src> {
         } else {
             // Requested resource is not yet cached. See if we can restore
             // it from source.
-            let f_load = inner.src.load(&id);
+            let f_load = inner.src.load(&id, false);
             let f_rm = inner.src.remove(&id);
             f_load.and_then(|_| f_rm).into_result()
         }
@@ -125,12 +134,12 @@ impl<Src: 'static + CacheSource> Cache<Src> {
 
 pub trait CacheSource: 'static + Send + Sync {
     type Value: Clone;
-    /// Load a new cached object. Return a value defined by default
-    /// configurations. In the course of loading, no state should be created
-    /// or written out of RAM, e.g., writing to files or calling to remote
+    /// Create a new cached object. Return a value defined by default
+    /// configurations if `create` is set. In the course of creation, no state
+    /// should be stored out of RAM, e.g., writing to files or calling to remote
     /// machines. The future returned MUST NOT excecute before the call to
     /// `poll()`.
-    fn load(&self, id: &str) -> WritiumResult<Self::Value>;
+    fn load(&self, id: &str, create: bool) -> WritiumResult<Self::Value>;
     /// Unload a cached object. Implementations should write the value into a
     /// recoverable form of storage, e.g., serializing data into JSON, if
     /// necessary. Cache unloading is an optional process. The future returned
