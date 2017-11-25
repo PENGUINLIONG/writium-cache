@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use writium_framework::prelude::*;
 use writium_framework::futures::Future;
 
-const UNABLE_TO_GEN_CACHE: &str = "Unable to generate cache because the resource doesn't exist.";
+const UNABLE_TO_UNLOAD_CACHE: &str = "Unable to unload cache.";
 const UNABLE_TO_REM_CACHE: &str = "Unable to remove cache because the resource doesn't exist.";
 const UNEXPECTED_USE_OF_CACHE: &str = "Unexpected use of cache.";
 
@@ -79,7 +79,7 @@ impl<Src: 'static + CacheSource> Cache<Src> {
                             if let Ok(rw) = Arc::try_unwrap(old_val) {
                             rw.into_inner().unwrap()
                         } else {
-                            warn!("{}: {}", UNEXPECTED_USE_OF_CACHE, id);
+                            warn!("{} Resource {}", UNEXPECTED_USE_OF_CACHE, id);
                             return err(WritiumError::internal(UNEXPECTED_USE_OF_CACHE))
                         };
                         inner.src.unload(&old_id, &mut old_val)
@@ -159,9 +159,12 @@ impl<Src: 'static + CacheSource> Drop for Cache<Src> {
         let mut lock = self.inner.cache.lock().unwrap();
         while let Some((id, val)) = lock.pop() {
             if let Ok(val) = Arc::try_unwrap(val) {
-                self.inner.src.unload(&id, &mut val.into_inner().unwrap());
+                if let Err(err) = self.inner.src.unload(&id, &mut val.into_inner().unwrap()).wait() {
+                    use std::error::Error;
+                    warn!("{} Resource {}: {}", UNABLE_TO_UNLOAD_CACHE, id, err.description());
+                }
             } else {
-                warn!("{}: {}", UNEXPECTED_USE_OF_CACHE, id);
+                warn!("{} Resource {}", UNEXPECTED_USE_OF_CACHE, id);
             }
         }
     }
