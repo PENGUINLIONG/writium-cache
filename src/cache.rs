@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 use writium_framework::prelude::*;
 use writium_framework::futures::Future;
+use writium_framework::futures::lazy;
 
 const UNABLE_TO_UNLOAD_CACHE: &str = "Unable to unload cache.";
 const UNABLE_TO_REM_CACHE: &str = "Unable to remove cache because the resource doesn't exist.";
@@ -39,32 +40,34 @@ impl<Src: 'static + CacheSource> Cache<Src> {
     /// recovering its cache from provided source. If there is no space for
     /// another object, the last recently accessed cache will be disposed.
     pub fn create(&self, id: &str) -> WritiumResult<Arc<RwLock<Src::Value>>> {
-        self._get(id, true)
+        let inner = self.inner.clone();
+        let id = id.to_string();
+        lazy(move || Self::_get(inner, &id, true)).into_result()
     }
     /// Get the object identified by given ID. If the object is not cached,
     /// error will be returned. If there is no space for another object, the
     /// last recently accessed cache will be disposed.
     pub fn get(&self, id: &str) -> WritiumResult<Arc<RwLock<Src::Value>>> {
-        self._get(id, false)
+        let inner = self.inner.clone();
+        let id = id.to_string();
+        lazy(move || Self::_get(inner, &id, false)).into_result()
     }
-    fn _get(&self, id: &str, create: bool) -> WritiumResult<Arc<RwLock<Src::Value>>> {
+    fn _get(inner: Arc<CacheInner<Src>>, id: &str, create: bool)
+        -> WritiumResult<Arc<RwLock<Src::Value>>> {
         let id = id.to_owned();
         let pos = {
-            let inner = self.inner.clone();
             let lock = inner.cache.lock().unwrap();
             lock.iter().position(|&(ref nid, _)| nid == &id)
         };
         if let Some(pos) = pos {
             // Cache found.
-            let inner = self.inner.clone();
             let mut lock = inner.cache.lock().unwrap();
             let res = lock.remove(pos);
             lock.push(res.clone());
             ok(res.1)
         } else {
             // Requested resource is not yet cached. Load now.
-            let inner = self.inner.clone();
-            self.inner.clone().src.load(&id, create)
+            inner.clone().src.load(&id, create)
                 .map(|new_val| { Arc::new(RwLock::new(new_val)) })
                 .join({
                     let mut lock = inner.cache.lock().unwrap();
@@ -104,19 +107,23 @@ impl<Src: 'static + CacheSource> Cache<Src> {
         let inner = self.inner.clone();
         let id = id.to_owned();
 
-        let mut lock = inner.cache.lock().unwrap();
-        let pos = lock.iter().position(|&(ref nid, _)| nid == &id);
-        if let Some(pos) = pos {
-            // Cache found.
-            let (old_id, _) = lock.remove(pos);
-            inner.src.remove(&old_id).into_result()
-        } else {
-            // Requested resource is not yet cached. See if we can restore
-            // it from source.
-            let f_load = inner.src.load(&id, false);
-            let f_rm = inner.src.remove(&id);
-            f_load.and_then(|_| f_rm).into_result()
-        }
+        lazy(move || {
+            let mut lock = inner.cache.lock().unwrap();
+            let pos = lock.iter().position(|&(ref nid, _)| nid == &id);
+            if let Some(pos) = pos {
+                // Cache found.
+                let (old_id, _) = lock.remove(pos);
+                inner.src.remove(&old_id)
+            } else {
+                let inn = inner.clone();
+                // Requested resource is not yet cached. See if we can restore
+                // it from source.
+                inner.src.load(&id, false)
+                    .and_then(move |_| inn.src.remove(&id))
+                    .into_result()
+            }
+        })
+        .into_result()
     }
 
     /// The maximum number of items can be cached at a same time.
@@ -137,18 +144,15 @@ pub trait CacheSource: 'static + Send + Sync {
     /// Create a new cached object. Return a value defined by default
     /// configurations if `create` is set. In the course of creation, no state
     /// should be stored out of RAM, e.g., writing to files or calling to remote
-    /// machines. The future returned MUST NOT excecute before the call to
-    /// `poll()`.
+    /// machines.
     fn load(&self, id: &str, create: bool) -> WritiumResult<Self::Value>;
     /// Unload a cached object. Implementations should write the value into a
     /// recoverable form of storage, e.g., serializing data into JSON, if
-    /// necessary. Cache unloading is an optional process. The future returned
-    /// MUST NOT excecute before the call to `poll()`.
+    /// necessary. Cache unloading is an optional process.
     fn unload(&self, _id: &str, _obj: &Self::Value) -> WritiumResult<()> { ok(()) }
     /// Remove a cached object. Implementations should remove any associated
     /// data from storage and invalidate any recoverability. Cache removal is an
-    /// optional process. The future returned MUST NOT excecute before the call
-    /// to `poll()`.
+    /// optional process.
     fn remove(&self, _id: &str) -> WritiumResult<()> { ok(()) }
 }
 impl<Src: 'static + CacheSource> Drop for Cache<Src> {
@@ -159,7 +163,8 @@ impl<Src: 'static + CacheSource> Drop for Cache<Src> {
         let mut lock = self.inner.cache.lock().unwrap();
         while let Some((id, val)) = lock.pop() {
             if let Ok(val) = Arc::try_unwrap(val) {
-                if let Err(err) = self.inner.src.unload(&id, &mut val.into_inner().unwrap()).wait() {
+                let f_unload = self.inner.src.unload(&id, &mut val.into_inner().unwrap());
+                if let Err(err) = f_unload.wait() {
                     use std::error::Error;
                     warn!("{} Resource {}: {}", UNABLE_TO_UNLOAD_CACHE, id, err.description());
                 }
