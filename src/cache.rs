@@ -1,101 +1,85 @@
-#![allow(dead_code)]
-///! Implementation of cache functionality for common use of Writium APIs.
+///! Implementation of caching for common use of Writium APIs.
+///!
+///! # Why I should use caches?
+///!
+///! The use of cache system can help you reduce disk I/O so that more fluent
+///! execution can be achieved.
+///!
+///! There is a question you may ask: why not simply use external caching
+///! systems (like Nginx)? The answer is, `writium-cache` and Nginx are totally
+///! different. Nginx caches *already generated* contents but `writium-cache`
+///! *prevents I/O blocking* of working threads. It's needed because Writium API
+///! calls are *synchronized* for you to write clean codes, before the stable.
 use std::sync::{Arc, Mutex, RwLock};
 use writium_framework::prelude::*;
-use writium_framework::futures::Future;
-use writium_framework::futures::lazy;
 
-const UNABLE_TO_UNLOAD_CACHE: &str = "Unable to unload cache.";
-const UNABLE_TO_REM_CACHE: &str = "Unable to remove cache because the resource doesn't exist.";
-const UNEXPECTED_USE_OF_CACHE: &str = "Unexpected use of cache.";
+const ERR_UNEXPECTED_OCCUPANCY: &str = "Unexpected use of cache.";
+const ERR_POISONED_THREAD: &str = "Current thread is poisoned.";
 
 /// Cache for each Writium Api. Any Writium Api can be composited with this
 /// struct for cache.
 struct CacheInner<Src: 'static + CacheSource> {
-    capacity: usize,
     cache: Mutex<Vec<(String, Arc<RwLock<Src::Value>>)>>,
     src: Src,
 }
 impl<Src: 'static + CacheSource> CacheInner<Src> {
     pub fn new(capacity: usize, src: Src) -> CacheInner<Src> {
         CacheInner {
-            capacity: capacity,
             cache: Mutex::new(Vec::with_capacity(capacity)),
             src: src,
         }
     }
 }
 #[derive(Clone)]
-pub struct Cache<Src: 'static + CacheSource> {
-    inner: Arc<CacheInner<Src>>
-}
+pub struct Cache<Src: 'static + CacheSource>(Arc<CacheInner<Src>>);
 impl<Src: 'static + CacheSource> Cache<Src> {
     pub fn new(capacity: usize, src: Src) -> Cache<Src> {
-        Cache {
-            inner: Arc::new(CacheInner::new(capacity, src)),
-        }
+        Cache(Arc::new(CacheInner::new(capacity, src)))
     }
 
     /// Get the object identified by given ID. If the object is not cached, try
     /// recovering its cache from provided source. If there is no space for
     /// another object, the last recently accessed cache will be disposed.
-    pub fn create(&self, id: &str) -> WritiumResult<Arc<RwLock<Src::Value>>> {
-        let inner = self.inner.clone();
-        let id = id.to_string();
-        lazy(move || Self::_get(inner, &id, true)).into_result()
+    pub fn create(&self, id: &str) -> Result<Arc<RwLock<Src::Value>>> {
+        self._get(&id, true)
     }
     /// Get the object identified by given ID. If the object is not cached,
     /// error will be returned. If there is no space for another object, the
     /// last recently accessed cache will be disposed.
-    pub fn get(&self, id: &str) -> WritiumResult<Arc<RwLock<Src::Value>>> {
-        let inner = self.inner.clone();
-        let id = id.to_string();
-        lazy(move || Self::_get(inner, &id, false)).into_result()
+    pub fn get(&self, id: &str) -> Result<Arc<RwLock<Src::Value>>> {
+        self._get(&id, false)
     }
-    fn _get(inner: Arc<CacheInner<Src>>, id: &str, create: bool)
-        -> WritiumResult<Arc<RwLock<Src::Value>>> {
-        let id = id.to_owned();
-        let pos = {
-            let lock = inner.cache.lock().unwrap();
-            lock.iter().position(|&(ref nid, _)| nid == &id)
+    fn _get(&self, id: &str, create: bool)
+        -> Result<Arc<RwLock<Src::Value>>> {
+        let mut cache = if let Ok(locked) = self.0.cache.lock() {
+            locked
+        } else {
+            return Err(Error::internal(ERR_POISONED_THREAD))
         };
-        if let Some(pos) = pos {
+        
+        if let Some(pos) = cache.iter().position(|&(ref jd, _)| jd == id) {
             // Cache found.
-            let mut lock = inner.cache.lock().unwrap();
-            let res = lock.remove(pos);
-            lock.push(res.clone());
-            ok(res.1)
+            let rsc = cache.remove(pos);
+            let rv = rsc.1.clone();
+            cache.push(rsc);
+            Ok(rv)
         } else {
             // Requested resource is not yet cached. Load now.
-            inner.clone().src.load(&id, create)
-                .map(|new_val| { Arc::new(RwLock::new(new_val)) })
-                .join({
-                    let mut lock = inner.cache.lock().unwrap();
-                    if lock.len() == lock.capacity() {
-                        // When this write lock is successfully retrieved, there
-                        // should be no other thread accessing it:
-                        //
-                        // 1. No read guard stays alive;
-                        // 2. It's nolonger accessed through `self.inner.cache`.
-                        let (old_id, old_val) = lock.remove(0);
-                        let mut old_val =
-                            if let Ok(rw) = Arc::try_unwrap(old_val) {
-                            rw.into_inner().unwrap()
-                        } else {
-                            warn!("{} Resource {}", UNEXPECTED_USE_OF_CACHE, id);
-                            return err(WritiumError::internal(UNEXPECTED_USE_OF_CACHE))
-                        };
-                        inner.src.unload(&old_id, &mut old_val)
-                    } else {
-                        ok(())
-                    }
-                })
-                .map(move |(new_arc, _)| {
-                    let mut lock = inner.cache.lock().unwrap();
-                    lock.push((id.to_string(), new_arc.clone()));
-                    new_arc
-                })
-                .into_result()
+            if cache.len() == cache.capacity() {
+                // When this write lock is successfully retrieved, there should
+                // be no other thread accessing it:
+                //
+                // 1. No read guard stays alive;
+                // 2. It's no longer accessed through `self.0.cache`.
+                Arc::try_unwrap(cache.remove(0).1)
+                    .map_err(|_| Error::internal(ERR_UNEXPECTED_OCCUPANCY))?
+                    .into_inner()
+                    .map_err(|_| Error::internal(ERR_POISONED_THREAD))
+                    .and_then(|mut val| self.0.src.unload(id, &mut val))?;
+            }
+            let arc = Arc::new(RwLock::new(self.0.src.load(&id, create)?));
+            cache.push((id.to_string(), arc.clone()));
+            Ok(arc)
         }
     }
 
@@ -103,73 +87,63 @@ impl<Src: 'static + CacheSource> Cache<Src> {
     /// try recovering its cache from provided source and then remove it. In
     /// case cache generation is needed, the cache stays intact with no cached
     /// object disposed, because the use of generated object is transient.
-    pub fn remove(&self, id: &str) -> WritiumResult<()> {
-        let inner = self.inner.clone();
-        let id = id.to_owned();
-
-        lazy(move || {
-            let mut lock = inner.cache.lock().unwrap();
-            let pos = lock.iter().position(|&(ref nid, _)| nid == &id);
-            if let Some(pos) = pos {
-                // Cache found.
-                let (old_id, _) = lock.remove(pos);
-                inner.src.remove(&old_id)
-            } else {
-                let inn = inner.clone();
-                // Requested resource is not yet cached. See if we can restore
-                // it from source.
-                inner.src.load(&id, false)
-                    .and_then(move |_| inn.src.remove(&id))
-                    .into_result()
-            }
-        })
-        .into_result()
+    pub fn remove(&self, id: &str) -> Result<()> {
+        let mut cache = self.0.cache.lock().unwrap();
+        cache.iter()
+            .position(|&(ref nid, _)| nid == &id)
+            .map(|pos| cache.remove(pos));
+        self.0.src.remove(&id)
     }
 
     /// The maximum number of items can be cached at a same time.
     pub fn capacity(&self) -> usize {
         // Only if the thread is poisoned `cache` will be unavailable.
-        self.inner.cache.lock().unwrap().capacity()
+        self.0.cache.lock().unwrap().capacity()
     }
 
     /// Get the number of items cached.
     pub fn len(&self) -> usize {
         // Only if the thread is poisoned `cache` will be unavailable.
-        self.inner.cache.lock().unwrap().len()
+        self.0.cache.lock().unwrap().len()
     }
 }
 
+/// A source where cache can be generated from.
 pub trait CacheSource: 'static + Send + Sync {
     type Value: Clone;
     /// Create a new cached object. Return a value defined by default
     /// configurations if `create` is set. In the course of creation, no state
     /// should be stored out of RAM, e.g., writing to files or calling to remote
     /// machines.
-    fn load(&self, id: &str, create: bool) -> WritiumResult<Self::Value>;
+    fn load(&self, id: &str, create: bool) -> Result<Self::Value>;
     /// Unload a cached object. Implementations should write the value into a
     /// recoverable form of storage, e.g., serializing data into JSON, if
     /// necessary. Cache unloading is an optional process.
-    fn unload(&self, _id: &str, _obj: &Self::Value) -> WritiumResult<()> { ok(()) }
+    fn unload(&self, _id: &str, _obj: &Self::Value) -> Result<()> {
+        Ok(())
+    }
     /// Remove a cached object. Implementations should remove any associated
-    /// data from storage and invalidate any recoverability. Cache removal is an
+    /// data from storage and invalidate any recoverability. If a resource
+    /// doesn't exist, the source shouldn't report an error. Cache removal is an
     /// optional process.
-    fn remove(&self, _id: &str) -> WritiumResult<()> { ok(()) }
+    fn remove(&self, _id: &str) -> Result<()> {
+        Ok(())
+    }
 }
 impl<Src: 'static + CacheSource> Drop for Cache<Src> {
     /// Implement drop so that modified cached data can be returned to source
     /// properly.
     fn drop(&mut self) {
         info!("Writing cached data back to source...");
-        let mut lock = self.inner.cache.lock().unwrap();
+        let mut lock = self.0.cache.lock().unwrap();
         while let Some((id, val)) = lock.pop() {
             if let Ok(val) = Arc::try_unwrap(val) {
-                let f_unload = self.inner.src.unload(&id, &mut val.into_inner().unwrap());
-                if let Err(err) = f_unload.wait() {
-                    use std::error::Error;
-                    warn!("{} Resource {}: {}", UNABLE_TO_UNLOAD_CACHE, id, err.description());
+                let unload = self.0.src.unload(&id, &mut val.into_inner().unwrap());
+                if let Err(err) = unload {
+                    warn!("Unable to unload '{}': {}", id, err);
                 }
             } else {
-                warn!("{} Resource {}", UNEXPECTED_USE_OF_CACHE, id);
+                warn!("Unexpected use of '{}'", id);
             }
         }
     }
@@ -177,20 +151,20 @@ impl<Src: 'static + CacheSource> Drop for Cache<Src> {
 
 #[cfg(test)]
 mod tests {
-    use ::writium_framework::futures::Future;
+    use writium_framework::prelude::*;
     // `bool` controls always fail.
     struct TestSource(bool);
     impl super::CacheSource for TestSource {
         type Value = &'static str;
-        fn load(&self, id: &str) -> Option<Self::Value> {
-            if self.0 { None }
-            else { Some(&["cache0", "cache1", "cache2", "cache3"][id.parse::<usize>().unwrap()]) }
+        fn load(&self, id: &str, _create: bool) -> Result<Self::Value> {
+            if self.0 { Err(Error::not_found("")) }
+            else { Ok(&["cache0", "cache1", "cache2", "cache3"][id.parse::<usize>().unwrap()]) }
         }
-        fn unload(&self, _id: &str, obj: &mut Self::Value) {
-            *obj = "disposed"
+        fn unload(&self, _id: &str, _obj: &Self::Value) -> Result<()> {
+            Ok(())
         }
-        fn remove(&self, _id: &str, obj: &mut Self::Value) {
-            *obj = "removed"
+        fn remove(&self, _id: &str) -> Result<()> {
+            Ok(())
         }
     }
     type TestCache = super::Cache<TestSource>;
@@ -202,48 +176,48 @@ mod tests {
     #[test]
     fn test_cache() {
         let cache = make_cache(false);
-        assert!(cache.get("0").wait().is_ok());
-        assert!(cache.get("1").wait().is_ok());
-        assert!(cache.get("2").wait().is_ok());
+        assert!(cache.get("0").is_ok());
+        assert!(cache.get("1").is_ok());
+        assert!(cache.get("2").is_ok());
     }
     #[test]
     fn test_cache_failure() {
         let cache = make_cache(true);
-        assert!(cache.get("0").wait().is_err());
-        assert!(cache.get("1").wait().is_err());
-        assert!(cache.get("2").wait().is_err());
+        assert!(cache.get("0").is_err());
+        assert!(cache.get("1").is_err());
+        assert!(cache.get("2").is_err());
     }
     #[test]
     fn test_max_cache() {
         let cache = make_cache(false);
         assert!(cache.len() == 0);
-        assert!(cache.get("0").wait().is_ok());
+        assert!(cache.get("0").is_ok());
         assert!(cache.len() == 1);
-        assert!(cache.get("1").wait().is_ok());
+        assert!(cache.get("1").is_ok());
         assert!(cache.len() == 2);
-        assert!(cache.get("2").wait().is_ok());
+        assert!(cache.get("2").is_ok());
         assert!(cache.len() == 3);
-        assert!(cache.get("3").wait().is_ok());
+        assert!(cache.get("3").is_ok());
         assert!(cache.len() == 3);
     }
     #[test]
     fn test_max_cache_failure() {
         let cache = make_cache(true);
         assert!(cache.len() == 0);
-        assert!(cache.get("0").wait().is_err());
+        assert!(cache.get("0").is_err());
         assert!(cache.len() == 0);
-        cache.get("1");
+        assert!(cache.get("1").is_err());
         assert!(cache.len() == 0);
-        cache.get("2");
+        assert!(cache.get("2").is_err());
         assert!(cache.len() == 0);
     }
     #[test]
     fn test_remove() {
         let cache = make_cache(false);
-        assert!(cache.get("0").wait().is_ok());
+        assert!(cache.get("0").is_ok());
         assert!(cache.len() == 1);
-        assert!(cache.remove("0").wait().is_ok());
+        assert!(cache.remove("0").is_ok());
         assert!(cache.len() == 0);
-        assert!(cache.remove("0").wait().is_ok());
+        assert!(cache.remove("0").is_ok());
     }
 }
