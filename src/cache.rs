@@ -18,40 +18,34 @@ const ERR_POISONED_THREAD: &str = "Current thread is poisoned.";
 
 /// Cache for each Writium Api. Any Writium Api can be composited with this
 /// struct for cache.
-struct CacheInner<Src: 'static + CacheSource> {
-    cache: Mutex<Vec<(String, Arc<RwLock<Src::Value>>)>>,
-    src: Src,
-}
-impl<Src: 'static + CacheSource> CacheInner<Src> {
-    pub fn new(capacity: usize, src: Src) -> CacheInner<Src> {
-        CacheInner {
-            cache: Mutex::new(Vec::with_capacity(capacity)),
-            src: src,
-        }
-    }
-}
 #[derive(Clone)]
-pub struct Cache<Src: 'static + CacheSource>(Arc<CacheInner<Src>>);
-impl<Src: 'static + CacheSource> Cache<Src> {
-    pub fn new(capacity: usize, src: Src) -> Cache<Src> {
-        Cache(Arc::new(CacheInner::new(capacity, src)))
+pub struct Cache<T: 'static> {
+    cache: Arc<Mutex<Vec<(String, Arc<RwLock<T>>)>>>,
+    src: Arc<CacheSource<Value=T>>,
+}
+impl<T: 'static> Cache<T> {
+    pub fn new<Src>(capacity: usize, src: Src) -> Cache<T>
+        where Src: 'static + CacheSource<Value=T> {
+        Cache {
+            cache: Arc::new(Mutex::new(Vec::with_capacity(capacity))),
+            src: Arc::new(src),
+        }
     }
 
     /// Get the object identified by given ID. If the object is not cached, try
     /// recovering its cache from provided source. If there is no space for
     /// another object, the last recently accessed cache will be disposed.
-    pub fn create(&self, id: &str) -> Result<Arc<RwLock<Src::Value>>> {
+    pub fn create(&self, id: &str) -> Result<Arc<RwLock<T>>> {
         self._get(&id, true)
     }
     /// Get the object identified by given ID. If the object is not cached,
     /// error will be returned. If there is no space for another object, the
     /// last recently accessed cache will be disposed.
-    pub fn get(&self, id: &str) -> Result<Arc<RwLock<Src::Value>>> {
+    pub fn get(&self, id: &str) -> Result<Arc<RwLock<T>>> {
         self._get(&id, false)
     }
-    fn _get(&self, id: &str, create: bool)
-        -> Result<Arc<RwLock<Src::Value>>> {
-        let mut cache = if let Ok(locked) = self.0.cache.lock() {
+    fn _get(&self, id: &str, create: bool) -> Result<Arc<RwLock<T>>> {
+        let mut cache = if let Ok(locked) = self.cache.lock() {
             locked
         } else {
             return Err(Error::internal(ERR_POISONED_THREAD))
@@ -75,9 +69,9 @@ impl<Src: 'static + CacheSource> Cache<Src> {
                     .map_err(|_| Error::internal(ERR_UNEXPECTED_OCCUPANCY))?
                     .into_inner()
                     .map_err(|_| Error::internal(ERR_POISONED_THREAD))
-                    .and_then(|mut val| self.0.src.unload(id, &mut val))?;
+                    .and_then(|mut val| self.src.unload(id, &mut val))?;
             }
-            let arc = Arc::new(RwLock::new(self.0.src.load(&id, create)?));
+            let arc = Arc::new(RwLock::new(self.src.load(&id, create)?));
             cache.push((id.to_string(), arc.clone()));
             Ok(arc)
         }
@@ -88,29 +82,29 @@ impl<Src: 'static + CacheSource> Cache<Src> {
     /// case cache generation is needed, the cache stays intact with no cached
     /// object disposed, because the use of generated object is transient.
     pub fn remove(&self, id: &str) -> Result<()> {
-        let mut cache = self.0.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap();
         cache.iter()
             .position(|&(ref nid, _)| nid == &id)
             .map(|pos| cache.remove(pos));
-        self.0.src.remove(&id)
+        self.src.remove(&id)
     }
 
     /// The maximum number of items can be cached at a same time.
     pub fn capacity(&self) -> usize {
         // Only if the thread is poisoned `cache` will be unavailable.
-        self.0.cache.lock().unwrap().capacity()
+        self.cache.lock().unwrap().capacity()
     }
 
     /// Get the number of items cached.
     pub fn len(&self) -> usize {
         // Only if the thread is poisoned `cache` will be unavailable.
-        self.0.cache.lock().unwrap().len()
+        self.cache.lock().unwrap().len()
     }
 }
 
 /// A source where cache can be generated from.
 pub trait CacheSource: 'static + Send + Sync {
-    type Value: Clone;
+    type Value: 'static;
     /// Create a new cached object. Return a value defined by default
     /// configurations if `create` is set. In the course of creation, no state
     /// should be stored out of RAM, e.g., writing to files or calling to remote
@@ -130,15 +124,15 @@ pub trait CacheSource: 'static + Send + Sync {
         Ok(())
     }
 }
-impl<Src: 'static + CacheSource> Drop for Cache<Src> {
+impl<T: 'static> Drop for Cache<T> {
     /// Implement drop so that modified cached data can be returned to source
     /// properly.
     fn drop(&mut self) {
         info!("Writing cached data back to source...");
-        let mut lock = self.0.cache.lock().unwrap();
+        let mut lock = self.cache.lock().unwrap();
         while let Some((id, val)) = lock.pop() {
             if let Ok(val) = Arc::try_unwrap(val) {
-                let unload = self.0.src.unload(&id, &mut val.into_inner().unwrap());
+                let unload = self.src.unload(&id, &mut val.into_inner().unwrap());
                 if let Err(err) = unload {
                     warn!("Unable to unload '{}': {}", id, err);
                 }
