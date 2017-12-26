@@ -161,7 +161,7 @@ mod tests {
             Ok(())
         }
     }
-    type TestCache = super::Cache<TestSource>;
+    type TestCache = super::Cache<&'static str>;
 
     fn make_cache(fail: bool) -> TestCache {
         TestCache::new(3, TestSource(fail))
