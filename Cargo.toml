@@ -1,6 +1,6 @@
 [package]
 name = "writium-cache"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["PENGUINLIONG <admin@penguinliong.moe>"]
 keywords = ["writium", "cache"]
 license = "MIT"
@@ -8,5 +8,5 @@ repository = "https://github.com/PENGUINLIONG/writium-cache"
 description = "Common cache system for Writium APIs"
 
 [dependencies]
-log = "*"
-writium-framework = { version = "0.1", path = "P:/writium-framework" }
+log = "0.4"
+writium = "0.1"

@@ -1,5 +1,5 @@
 use std::marker::PhantomData;
-use writium_framework::prelude::*;
+use writium::prelude::*;
 use cache::CacheSource;
 
 const ERR_DUMB: &'static str = "Dumb cache is used, nothing is extracted.";

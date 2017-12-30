@@ -1,6 +1,6 @@
 #[macro_use]
 extern crate log;
-extern crate writium_framework;
+extern crate writium;
 
 mod cache;
 mod dumb;

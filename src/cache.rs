@@ -11,7 +11,7 @@
 ///! *prevents I/O blocking* of working threads. It's needed because Writium API
 ///! calls are *synchronized* for you to write clean codes, before the stable.
 use std::sync::{Arc, Mutex, RwLock};
-use writium_framework::prelude::*;
+use writium::prelude::*;
 
 const ERR_UNEXPECTED_OCCUPANCY: &str = "Unexpected use of cache.";
 const ERR_POISONED_THREAD: &str = "Current thread is poisoned.";
@@ -77,10 +77,7 @@ impl<T: 'static> Cache<T> {
         }
     }
 
-    /// Remove the object identified by given ID. If the object is not cached,
-    /// try recovering its cache from provided source and then remove it. In
-    /// case cache generation is needed, the cache stays intact with no cached
-    /// object disposed, because the use of generated object is transient.
+    /// Remove the object identified by given ID.
     pub fn remove(&self, id: &str) -> Result<()> {
         let mut cache = self.cache.lock().unwrap();
         cache.iter()
@@ -145,7 +142,7 @@ impl<T: 'static> Drop for Cache<T> {
 
 #[cfg(test)]
 mod tests {
-    use writium_framework::prelude::*;
+    use writium::prelude::*;
     // `bool` controls always fail.
     struct TestSource(bool);
     impl super::CacheSource for TestSource {
