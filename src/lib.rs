@@ -2,6 +2,10 @@
 extern crate log;
 extern crate writium;
 
+mod item;
+
+pub use item::CacheItem;
+
 mod cache;
 mod dumb;
 

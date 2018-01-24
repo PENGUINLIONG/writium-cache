@@ -10,70 +10,99 @@
 ///! different. Nginx caches *already generated* contents but `writium-cache`
 ///! *prevents I/O blocking* of working threads. It's needed because Writium API
 ///! calls are *synchronized* for you to write clean codes, before the stable.
-use std::sync::{Arc, Mutex, RwLock};
+///!
+///! # About pending
+///!
+///! For now, `writium-cache` doesn't offer any multi-threading features, but it
+///! guarantees that everything won't go wrong in such context. There is only
+///! one thread is involved at a time for a single `Cache` object. Everytime an
+///! uncached item is requested, an cached item needs to be unloaded/removed,
+///! heavy I/O might come up. In such period of time I/O-ing, the item is
+///! attributed 'pending'. Items in such state is not exposed to users. And it
+///! can influence the entire system's efficiency seriously by blocking threads.
+///! Such outcome is undesirable commonly. Thus, 'pending' state is considered a
+///! performance issue and should be fixed in future versions.
+///!
+///! There are two cases an item is in 'pending' state:
+///!
+///! 1. Cached data was dirty and is now 'abandoned' by `Cache` - a
+///! corresponding `CacheSource` has been trying Writing the data back to
+///! local storage. If the data is requested again after this intermediate
+///! state, the state will be restored to `Intact`. When unloading is
+///! finished, data is written back to storage and is removed from the owning
+///! `Cache`.
+///!
+///! 2. Cached data is being removed by a corresponding `CacheSource`. If the
+///! data is requested again after this intermediate state, the state will be
+///! restored to `Dirty` (as a new instance is created). When removal is
+///! finished, data is removed from storage (as well as the owning `Cache`, if
+///! the data was loaded).
+use std::sync::{Arc, Mutex};
 use writium::prelude::*;
+use item::CacheItem;
 
-const ERR_UNEXPECTED_OCCUPANCY: &str = "Unexpected use of cache.";
 const ERR_POISONED_THREAD: &str = "Current thread is poisoned.";
 
 /// Cache for each Writium Api. Any Writium Api can be composited with this
 /// struct for cache.
-#[derive(Clone)]
 pub struct Cache<T: 'static> {
-    cache: Arc<Mutex<Vec<(String, Arc<RwLock<T>>)>>>,
-    src: Arc<CacheSource<Value=T>>,
+    /// In `cache`, the flag `is_dirty` of an item indicates whether it should
+    /// be written back to source.
+    cache: Mutex<Vec<Arc<CacheItem<T>>>>,
+    src: Box<CacheSource<Value=T>>,
 }
 impl<T: 'static> Cache<T> {
     pub fn new<Src>(capacity: usize, src: Src) -> Cache<T>
         where Src: 'static + CacheSource<Value=T> {
         Cache {
-            cache: Arc::new(Mutex::new(Vec::with_capacity(capacity))),
-            src: Arc::new(src),
+            cache: Mutex::new(Vec::with_capacity(capacity)),
+            src: Box::new(src),
         }
     }
-
     /// Get the object identified by given ID. If the object is not cached, try
     /// recovering its cache from provided source. If there is no space for
     /// another object, the last recently accessed cache will be disposed.
-    pub fn create(&self, id: &str) -> Result<Arc<RwLock<T>>> {
+    pub fn create(&self, id: &str) -> Result<Arc<CacheItem<T>>> {
         self._get(&id, true)
     }
     /// Get the object identified by given ID. If the object is not cached,
     /// error will be returned. If there is no space for another object, the
     /// last recently accessed cache will be disposed.
-    pub fn get(&self, id: &str) -> Result<Arc<RwLock<T>>> {
+    pub fn get(&self, id: &str) -> Result<Arc<CacheItem<T>>> {
         self._get(&id, false)
     }
-    fn _get(&self, id: &str, create: bool) -> Result<Arc<RwLock<T>>> {
-        let mut cache = if let Ok(locked) = self.cache.lock() {
-            locked
-        } else {
-            return Err(Error::internal(ERR_POISONED_THREAD))
-        };
-        
-        if let Some(pos) = cache.iter().position(|&(ref jd, _)| jd == id) {
+
+    fn _get(&self, id: &str, create: bool) -> Result<Arc<CacheItem<T>>> {
+        // Not intended to introduce too much complexity.
+        let mut cache = self.cache.lock()
+            .map_err(|_| Error::internal(ERR_POISONED_THREAD))?;
+        if let Some(pos) = cache.iter()
+            .position(|item| item.id() == id) {
             // Cache found.
-            let rsc = cache.remove(pos);
-            let rv = rsc.1.clone();
-            cache.push(rsc);
-            Ok(rv)
+            let arc = cache.remove(pos);
+            cache.insert(0, arc.clone());
+            return Ok(arc)
         } else {
             // Requested resource is not yet cached. Load now.
-            if cache.len() == cache.capacity() {
-                // When this write lock is successfully retrieved, there should
-                // be no other thread accessing it:
-                //
-                // 1. No read guard stays alive;
-                // 2. It's no longer accessed through `self.0.cache`.
-                Arc::try_unwrap(cache.remove(0).1)
-                    .map_err(|_| Error::internal(ERR_UNEXPECTED_OCCUPANCY))?
-                    .into_inner()
-                    .map_err(|_| Error::internal(ERR_POISONED_THREAD))
-                    .and_then(|mut val| self.src.unload(id, &mut val))?;
+            let new_item = CacheItem::new(id, self.src.load(id, create)?);
+            let new_arc = Arc::new(new_item);
+            // Not actually caching anything when capacity is 0.
+            if cache.capacity() == 0 {
+                return Ok(new_arc)
             }
-            let arc = Arc::new(RwLock::new(self.src.load(&id, create)?));
-            cache.push((id.to_string(), arc.clone()));
-            Ok(arc)
+            // Remove the least-recently-used item from collection.
+            if cache.len() == cache.capacity() {
+                let lru_item = cache.pop().unwrap();
+                // Unload items only when they are dirty.
+                if lru_item.is_dirty() {
+                    let data = lru_item.write()?;
+                    if let Err(err) = self.src.unload(id, &*data) {
+                        error!("Unable to unload '{}': {}", id, err);
+                    }   
+                }
+            }
+            cache.insert(0, new_arc.clone());
+            return Ok(new_arc)
         }
     }
 
@@ -81,18 +110,20 @@ impl<T: 'static> Cache<T> {
     pub fn remove(&self, id: &str) -> Result<()> {
         let mut cache = self.cache.lock().unwrap();
         cache.iter()
-            .position(|&(ref nid, _)| nid == &id)
+            .position(|nid| nid.id() == id)
             .map(|pos| cache.remove(pos));
         self.src.remove(&id)
     }
 
-    /// The maximum number of items can be cached at a same time.
+    /// The maximum number of items can be cached at a same time. Tests only.
+    #[cfg(test)]
     pub fn capacity(&self) -> usize {
         // Only if the thread is poisoned `cache` will be unavailable.
         self.cache.lock().unwrap().capacity()
     }
 
-    /// Get the number of items cached.
+    /// Get the number of items cached. Tests only.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         // Only if the thread is poisoned `cache` will be unavailable.
         self.cache.lock().unwrap().len()
@@ -125,16 +156,12 @@ impl<T: 'static> Drop for Cache<T> {
     /// Implement drop so that modified cached data can be returned to source
     /// properly.
     fn drop(&mut self) {
-        info!("Writing cached data back to source...");
         let mut lock = self.cache.lock().unwrap();
-        while let Some((id, val)) = lock.pop() {
-            if let Ok(val) = Arc::try_unwrap(val) {
-                let unload = self.src.unload(&id, &mut val.into_inner().unwrap());
-                if let Err(err) = unload {
-                    warn!("Unable to unload '{}': {}", id, err);
-                }
-            } else {
-                warn!("Unexpected use of '{}'", id);
+        while let Some(item) = lock.pop() {
+            if !item.is_dirty() { continue }
+            let guard = item.write().unwrap();
+            if let Err(err) = self.src.unload(item.id(), &guard) {
+                warn!("Unable to unload '{}': {}", item.id(), err);
             }
         }
     }
