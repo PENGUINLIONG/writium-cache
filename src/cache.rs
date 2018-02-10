@@ -96,7 +96,7 @@ impl<T: 'static> Cache<T> {
                 // Unload items only when they are dirty.
                 if lru_item.is_dirty() {
                     let data = lru_item.write()?;
-                    if let Err(err) = self.src.unload(id, &*data) {
+                    if let Err(err) = self.src.unload(lru_item.id(), &*data) {
                         error!("Unable to unload '{}': {}", id, err);
                     }   
                 }
